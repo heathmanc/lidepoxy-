@@ -66,13 +66,28 @@ except Exception:
     detect = None
     HAVE_DETECT = False
 
+# Live offset measurement (detect -> calibrate -> pose) and PLC publish.
+try:
+    import pose
+except Exception:
+    pose = None
+try:
+    import calibrate
+except Exception:
+    calibrate = None
+try:
+    import plc
+except Exception:
+    plc = None
+HAVE_MEASURE = HAVE_DETECT and (pose is not None) and (calibrate is not None)
+
 from PyQt5.QtCore import (Qt, QThread, pyqtSignal, QMutex, QMutexLocker,
                           QPointF, QRectF, QTimer)
 from PyQt5.QtGui import QImage, QPixmap, QPainter, QPen, QColor, QFont
 from PyQt5.QtWidgets import (
     QApplication, QMainWindow, QWidget, QLabel, QSlider, QCheckBox, QComboBox,
     QPushButton, QDoubleSpinBox, QGroupBox, QVBoxLayout, QHBoxLayout,
-    QFormLayout, QFileDialog, QSizePolicy
+    QFormLayout, QFileDialog, QSizePolicy, QLineEdit
 )
 
 try:
@@ -505,6 +520,11 @@ class MainWindow(QMainWindow):
         self._last_detect_t = 0.0  # throttle for live detection
         self._last_actual_exp = None   # most recent camera-reported exposure/gain
         self._last_actual_gain = None  # used to freeze the UI when auto turns off
+        # Live offset measurement (detect -> calibrate -> pose -> PLC)
+        self.calibration = None
+        self._reference = {"A": None, "B": None}   # taught nominal layout per side
+        self._measured = {"A": {}, "B": {}}        # latest fiducials in mm per side
+        self._offsets = {"A": None, "B": None}      # latest PoseResult per side
         self._build_ui()
         self._populate_devices()
 
@@ -536,6 +556,7 @@ class MainWindow(QMainWindow):
         pv.addWidget(self._gain_group())
         pv.addWidget(self._readout_group())
         pv.addWidget(self._fiducial_group())
+        pv.addWidget(self._measure_group())
         pv.addWidget(self._capture_group())
         pv.addStretch(1)
         panel.setFixedWidth(340)
@@ -643,6 +664,44 @@ class MainWindow(QMainWindow):
         l.addRow(self.detect_chk)
         return box
 
+    def _measure_group(self):
+        """Live measured offset: load a calibration, teach a reference layout,
+        then read dX/dY/dR + confidence per side, and publish to the PLC."""
+        box = QGroupBox("Measured offset (Side A / B)")
+        l = QVBoxLayout(box)
+        self.cal_label = QLabel("No calibration loaded.")
+        self.cal_label.setWordWrap(True)
+        l.addWidget(self.cal_label)
+
+        row = QHBoxLayout()
+        b_cal = QPushButton("Load calibration…")
+        b_cal.clicked.connect(self._load_calibration)
+        b_ref = QPushButton("Teach reference")
+        b_ref.clicked.connect(self._teach_reference)
+        row.addWidget(b_cal)
+        row.addWidget(b_ref)
+        l.addLayout(row)
+
+        self.off_a = QLabel("A: —")
+        self.off_b = QLabel("B: —")
+        for w in (self.off_a, self.off_b):
+            w.setStyleSheet("font-family: monospace;")
+            l.addWidget(w)
+
+        prow = QHBoxLayout()
+        self.plc_ip = QLineEdit()
+        self.plc_ip.setPlaceholderText("PLC IP (blank = mock)")
+        b_pub = QPushButton("Publish")
+        b_pub.clicked.connect(self._publish_offsets)
+        prow.addWidget(self.plc_ip, 1)
+        prow.addWidget(b_pub)
+        l.addLayout(prow)
+
+        if not HAVE_MEASURE:
+            box.setEnabled(False)
+            self.cal_label.setText("Measurement needs OpenCV (detect + calibrate).")
+        return box
+
     def _capture_group(self):
         box = QGroupBox("Capture")
         l = QVBoxLayout(box)
@@ -720,9 +779,14 @@ class MainWindow(QMainWindow):
             qimg = QImage(rgb.data, w, h, 3 * w, QImage.Format_RGB888).copy()
         pm = QPixmap.fromImage(qimg).scaled(
             self.view.size(), Qt.KeepAspectRatio, Qt.SmoothTransformation)
-        if HAVE_DETECT and self.detect_chk.isChecked():
+        # Detect when the overlay is on OR a calibration is loaded (so the live
+        # offset keeps updating even with the overlay hidden).
+        want_detect = HAVE_DETECT and (self.detect_chk.isChecked()
+                                       or self.calibration is not None)
+        if want_detect:
             self._maybe_detect(frame)
-            self._draw_dets(pm, w, h)
+            if self.detect_chk.isChecked():
+                self._draw_dets(pm, w, h)
         self.view.setPixmap(pm)
 
     def _maybe_detect(self, frame):
@@ -738,12 +802,111 @@ class MainWindow(QMainWindow):
             self._dets = []
             self.status.setText(f"Detect error: {e}")
             return
-        if self._dets:
-            conf = sum(d.confidence for d in self._dets) / len(self._dets)
-            self.status.setText(
-                f"Detected {len(self._dets)} fiducial(s), mean confidence {conf:.2f}")
+        if self.detect_chk.isChecked():
+            if self._dets:
+                conf = sum(d.confidence for d in self._dets) / len(self._dets)
+                self.status.setText(
+                    f"Detected {len(self._dets)} fiducial(s), mean confidence {conf:.2f}")
+            else:
+                self.status.setText("No fiducials detected.")
+        self._update_measurement()
+
+    # ---- live offset measurement --------------------------------------- #
+    def _update_measurement(self):
+        """Map detected fiducials to mm via the calibration and, against a taught
+        reference, solve the per-side offset. Cheap; runs each detection tick."""
+        if not (HAVE_MEASURE and self.calibration is not None):
+            return
+        cal = self.calibration
+        for side, label in (("A", self.off_a), ("B", self.off_b)):
+            measured = {}
+            for d in self._dets:
+                if d.side == side and d.fid_id:
+                    mm = cal.pixel_to_world([(d.cx, d.cy)])[0]
+                    measured[d.fid_id] = (float(mm[0]), float(mm[1]))
+            self._measured[side] = measured
+            ref = self._reference.get(side)
+            if not ref:
+                self._offsets[side] = None
+                label.setText(f"{side}: teach reference ({len(measured)} fid)")
+            elif len(measured) < 2:
+                self._offsets[side] = None
+                label.setText(f"{side}: need ≥ 2 fiducials ({len(measured)})")
+            else:
+                res = pose.solve_pose(ref, measured)
+                self._offsets[side] = res
+                if res.ok:
+                    label.setText(
+                        f"{side}: dX{res.dx_mm:+.3f} dY{res.dy_mm:+.3f} "
+                        f"dR{res.dr_deg:+.3f}° c{res.confidence:.2f}")
+                else:
+                    label.setText(f"{side}: {res.reason}")
+
+    def _load_calibration(self):
+        if calibrate is None:
+            self.status.setText("calibrate.py unavailable.")
+            return
+        path, _ = QFileDialog.getOpenFileName(
+            self, "Load calibration", self.outdir, "Calibration JSON (*.json)")
+        if not path:
+            return
+        try:
+            self.calibration = calibrate.Calibration.load(path)
+        except Exception as e:
+            self.status.setText(f"Calibration load failed: {e}")
+            return
+        c = self.calibration
+        self.cal_label.setText(
+            f"Cal {c.cal_id}   RMS {c.rms_error_mm:.3f} mm   ({c.n_points} pts)")
+        self.status.setText(f"Loaded calibration {c.cal_id}")
+
+    def _teach_reference(self):
+        taught = []
+        for side in ("A", "B"):
+            m = self._measured.get(side) or {}
+            if len(m) >= 2:
+                self._reference[side] = dict(m)
+                taught.append(side)
+        if taught:
+            self.status.setText(f"Reference taught (current = zero offset) for "
+                                f"side(s): {', '.join(taught)}")
         else:
-            self.status.setText("No fiducials detected.")
+            self.status.setText("Teach reference: load a calibration and detect "
+                                "fiducials first.")
+
+    def _publish_offsets(self):
+        if plc is None:
+            self.status.setText("plc.py unavailable.")
+            return
+        if self.calibration is None:
+            self.status.setText("Load a calibration first.")
+            return
+        ready = {s: o for s, o in self._offsets.items() if o is not None and o.ok}
+        if not ready:
+            self.status.setText("No valid offset to publish (teach reference + detect).")
+            return
+        ip = self.plc_ip.text().strip()
+        use_real = bool(ip) and plc.HAVE_PYLOGIX
+        try:
+            backend = plc.PylogixBackend(ip) if use_real else plc.MockPLCBackend()
+            backend.connect()
+        except Exception as e:
+            self.status.setText(f"PLC connect failed: {e}")
+            return
+        try:
+            pub = plc.OffsetPublisher(backend, min_confidence=0.5)
+            sent = []
+            for side, res in ready.items():
+                pub.publish(side, res, self.calibration.cal_id)
+                sent.append(side)
+        except Exception as e:
+            self.status.setText(f"Publish failed: {e}")
+            return
+        finally:
+            backend.close()
+        where = f"PLC {ip}" if use_real else "mock PLC"
+        self.status.setText(f"Published side(s) {', '.join(sent)} to {where} "
+                            f"(cal {self.calibration.cal_id}).")
 
     def _draw_dets(self, pm, src_w, src_h):
         if not self._dets:
