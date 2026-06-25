@@ -22,7 +22,9 @@ Full concept design: [`docs/fanuc_epoxy_vision_system_design.pdf`](docs/fanuc_ep
 | `vision_gui.py` | PyQt5 setup GUI: device selection, exposure/gain sliders + auto toggles with a **live camera-status readout** (actual exposure/gain/fps even in auto), live view, fiducial settings with live Side A / Side B pallet schematics, an optional **live fiducial-detection overlay**, lossless PNG save. Runs with `--mock` (no camera needed). |
 | `capture.py` | Standalone Basler capture utility: full-res grab, live view with exposure/gain tuning keys, lossless PNG save, headless batch mode. |
 | `detect.py` | Fiducial detector: dark-insert-on-bright-backing → threshold → contour → ellipse fit → sub-pixel centre, with circularity / fill / concentricity quality checks. Auto (find pads → inserts) or ROI-guided. `python3 detect.py --mock` self-tests against a synthetic scene. |
-| `fiducial_config.py` | Shared fiducial geometry (diameter / spacing / corner layout) — the single source used by the GUI and the detector. |
+| `calibrate.py` | Pixel → robot-plane (mm) calibration: planar homography, persisted with an ID, timestamp, image size, and RMS / MAX reprojection error. `python3 calibrate.py --mock` self-tests; `--points pts.json --out cal.json` fits from real correspondences. |
+| `pose.py` | Pallet pose solve: best-fit rigid transform (nominal layout → measured) → **dX / dY / dR offset** + per-fiducial residual + confidence, referenced to the lid frame centroid. Pure numpy. `python3 pose.py --mock` self-tests, including an end-to-end detect → calibrate → pose chain. |
+| `fiducial_config.py` | Shared fiducial geometry (diameter / spacing / corner layout) — the single source used by the GUI, the detector, and the pose solve. |
 | `requirements.txt` | Python pip dependencies. |
 | `CLAUDE.md` | Project context for Claude Code. |
 | `docs/` | Design document. |
@@ -114,8 +116,8 @@ metrology).
 |-------|--------|-------|
 | 1. Capture | done — `capture.py`, `vision_gui.py` | Image acquisition + setup |
 | 2. Fiducial detection | in progress — `detect.py` | 10 mm dark-on-bright: ROI → threshold → contour → ellipse fit → sub-pixel centre; circularity / fill / concentricity quality checks. Wired as a live GUI overlay; passes a synthetic self-test. **Next: tune thresholds against real captured frames.** |
-| 3. Grid calibration | todo | pixel → robot-plane mapping at lid height (planar homography, or full intrinsics + distortion if edge residuals are high) |
-| 4. Pose solve | todo | best-fit rigid transform (nominal layout → measured); output X/Y/R + residual |
+| 3. Grid calibration | in progress — `calibrate.py` | pixel → robot-plane homography, persisted with ID + RMS / MAX error. Passes a synthetic self-test. **Next: fit from a real calibration-target capture; move to full intrinsics + distortion if edge residuals eat the budget.** |
+| 4. Pose solve | in progress — `pose.py` | best-fit rigid transform (nominal layout → measured) → dX/dY/dR + per-fiducial residual + confidence, referenced to the lid centroid. Passes isolated + end-to-end self-tests. **Next: wire into the GUI as a live offset readout; confirm rotation sign on the robot.** |
 | 5. PLC comms | todo | pylogix → CompactLogix; write payload first, set valid/Seq_ID bit last |
 | 6. FANUC offset | todo | PLC → robot over EtherNet/IP; PR[50]/PR[51] vision offset |
 | 7. Lid-datum cross-check | todo | detect lid datum, report lid-vs-pallet residual (log-only first) |
