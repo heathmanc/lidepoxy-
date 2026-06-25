@@ -1,0 +1,34 @@
+# --- Project outputs (large / machine-specific — keep out of git) ---
+captures/
+*.raw
+*.bmp
+*.tiff
+*.tif
+
+# Calibration + machine setup data (track deliberately if you ever want to,
+# but by default these are per-machine and should not be committed)
+calibration/
+*.npz
+
+# --- Python ---
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+.eggs/
+build/
+dist/
+
+# Virtual environments
+.venv/
+venv/
+env/
+ENV/
+
+# --- OS / editor ---
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+*.swp
+*~

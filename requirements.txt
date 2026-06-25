@@ -1,0 +1,14 @@
+# Python dependencies for the lidepoxy vision tools.
+# Install on the Jetson with:
+#     pip3 install --upgrade pip       # pypylon wheels need pip >= 20.3
+#     pip3 install -r requirements.txt
+#
+# NOTE: PyQt5 is intentionally NOT listed here. On Jetson / aarch64 a pip build
+# of PyQt5 can fail; install it via apt instead:
+#     sudo apt install python3-pyqt5
+#
+# Tested target: Jetson Orin AGX, JetPack 6.2.1 (Ubuntu 22.04, Python 3.10).
+
+pypylon          # Basler camera SDK Python bindings (prebuilt aarch64 wheels on PyPI)
+opencv-python    # image I/O + processing (PNG save now; detection/calibration later)
+numpy            # array math
