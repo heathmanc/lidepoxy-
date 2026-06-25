@@ -19,8 +19,10 @@ Full concept design: [`docs/fanuc_epoxy_vision_system_design.pdf`](docs/fanuc_ep
 
 | File | What it is |
 |------|------------|
-| `vision_gui.py` | PyQt5 setup GUI: device selection, exposure/gain sliders + auto toggles, live view, fiducial settings with live Side A / Side B pallet schematics, lossless PNG save. Runs with `--mock` (no camera needed). |
+| `vision_gui.py` | PyQt5 setup GUI: device selection, exposure/gain sliders + auto toggles with a **live camera-status readout** (actual exposure/gain/fps even in auto), live view, fiducial settings with live Side A / Side B pallet schematics, an optional **live fiducial-detection overlay**, lossless PNG save. Runs with `--mock` (no camera needed). |
 | `capture.py` | Standalone Basler capture utility: full-res grab, live view with exposure/gain tuning keys, lossless PNG save, headless batch mode. |
+| `detect.py` | Fiducial detector: dark-insert-on-bright-backing → threshold → contour → ellipse fit → sub-pixel centre, with circularity / fill / concentricity quality checks. Auto (find pads → inserts) or ROI-guided. `python3 detect.py --mock` self-tests against a synthetic scene. |
+| `fiducial_config.py` | Shared fiducial geometry (diameter / spacing / corner layout) — the single source used by the GUI and the detector. |
 | `requirements.txt` | Python pip dependencies. |
 | `CLAUDE.md` | Project context for Claude Code. |
 | `docs/` | Design document. |
@@ -111,7 +113,7 @@ metrology).
 | Stage | Status | Notes |
 |-------|--------|-------|
 | 1. Capture | done — `capture.py`, `vision_gui.py` | Image acquisition + setup |
-| 2. Fiducial detection | next | 10 mm dark-on-bright: ROI → threshold/edge → contour → fit circle/ellipse → sub-pixel center; concentric-ring check. Tune to real frames; wire as a live GUI overlay. |
+| 2. Fiducial detection | in progress — `detect.py` | 10 mm dark-on-bright: ROI → threshold → contour → ellipse fit → sub-pixel centre; circularity / fill / concentricity quality checks. Wired as a live GUI overlay; passes a synthetic self-test. **Next: tune thresholds against real captured frames.** |
 | 3. Grid calibration | todo | pixel → robot-plane mapping at lid height (planar homography, or full intrinsics + distortion if edge residuals are high) |
 | 4. Pose solve | todo | best-fit rigid transform (nominal layout → measured); output X/Y/R + residual |
 | 5. PLC comms | todo | pylogix → CompactLogix; write payload first, set valid/Seq_ID bit last |

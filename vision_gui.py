@@ -47,7 +47,6 @@ import math
 import os
 import sys
 import time
-from dataclasses import dataclass
 from datetime import datetime
 
 import numpy as np
@@ -56,6 +55,16 @@ try:
     import cv2  # only needed for saving PNGs
 except ImportError:
     cv2 = None
+
+from fiducial_config import FiducialConfig  # single source of fiducial geometry
+
+# Live fiducial-detection overlay is optional - it needs OpenCV (via detect.py).
+try:
+    import detect
+    HAVE_DETECT = cv2 is not None
+except Exception:
+    detect = None
+    HAVE_DETECT = False
 
 from PyQt5.QtCore import (Qt, QThread, pyqtSignal, QMutex, QMutexLocker,
                           QPointF, QRectF, QTimer)
@@ -74,30 +83,6 @@ except ImportError:
 
 
 # ===========================================================================
-#  Fiducial configuration model
-# ===========================================================================
-@dataclass
-class FiducialConfig:
-    diameter_mm: float = 10.0      # bored-hole diameter (design doc: 10 mm)
-    spacing_x_mm: float = 220.0    # left<->right distance (fiducial 1 <-> 2)
-    spacing_y_mm: float = 150.0    # top<->bottom distance (fiducial 1 <-> 3)
-    arrangement: str = "Rectangle (4-corner)"
-
-    def corners_mm(self):
-        """Fiducial centres in mm, origin-centred. Numbering matches the doc."""
-        sx, sy = self.spacing_x_mm / 2.0, self.spacing_y_mm / 2.0
-        return [
-            (-sx,  sy),   # 1 top-left
-            ( sx,  sy),   # 2 top-right
-            (-sx, -sy),   # 3 bottom-left
-            ( sx, -sy),   # 4 bottom-right
-        ]
-
-    def diagonal_mm(self):
-        return math.hypot(self.spacing_x_mm, self.spacing_y_mm)
-
-
-# ===========================================================================
 #  Camera backends (real Basler + synthetic mock), one interface
 # ===========================================================================
 class CameraBackend:
@@ -109,6 +94,8 @@ class CameraBackend:
     def set_exposure(self, us): pass
     def set_auto_gain(self, on): pass
     def set_gain(self, db): pass
+    def get_status(self): return {}      # actual, camera-reported values
+    def get_ranges(self): return {}      # exposure / gain min-max for the UI
     def close(self): pass
 
 
@@ -129,28 +116,55 @@ class MockBackend(CameraBackend):
     Brightness follows the exposure setting so the sliders visibly do something."""
     name = "Mock camera (synthetic)"
 
+    # synthetic auto-loop targets (us / dB) the mock "converges" toward
+    _AUTO_EXP_TARGET = 8000.0
+    _AUTO_GAIN_TARGET = 6.0
+    EXP_MIN, EXP_MAX = 50.0, 100000.0
+    GAIN_MIN, GAIN_MAX = 0.0, 36.0
+
     def __init__(self, w=1280, h=1024):
         self.w, self.h = w, h
-        self._exp = 10000.0
-        self._gain = 0.0
+        self._exp = 10000.0          # commanded
+        self._gain = 0.0             # commanded
         self._auto_exp = False
+        self._auto_gain = False
+        self._eff_exp = self._exp    # effective (what the sensor actually used)
+        self._eff_gain = self._gain
 
     def open(self):
         pass
 
     def set_auto_exposure(self, on): self._auto_exp = bool(on)
     def set_exposure(self, us): self._exp = float(us)
-    def set_auto_gain(self, on): pass
+    def set_auto_gain(self, on): self._auto_gain = bool(on)
     def set_gain(self, db): self._gain = float(db)
     def set_pixel_format(self, fmt): pass
 
+    def get_status(self):
+        return {
+            "exposure_us": self._eff_exp, "gain_db": self._eff_gain,
+            "auto_exposure": self._auto_exp, "auto_gain": self._auto_gain,
+            "fps": 30.0, "width": self.w, "height": self.h,
+            "pixel_format": "Mono8 (mock)",
+        }
+
+    def get_ranges(self):
+        return {"exposure_min": self.EXP_MIN, "exposure_max": self.EXP_MAX,
+                "gain_min": self.GAIN_MIN, "gain_max": self.GAIN_MAX}
+
     def grab(self, timeout_ms=2000):
         time.sleep(0.03)  # ~30 fps synthetic
-        e = max(self._exp, 50.0)
-        bright = 170 if self._auto_exp else int(np.clip(
-            40 + 60 * math.log10(e / 50.0), 30, 235))
+        # Converge the effective exposure/gain: snap to the command when manual,
+        # ease toward the synthetic auto target when auto - so the live readout
+        # has something real to report even while auto is settling.
+        self._eff_exp += 0.25 * ((self._AUTO_EXP_TARGET if self._auto_exp
+                                  else self._exp) - self._eff_exp)
+        self._eff_gain += 0.25 * ((self._AUTO_GAIN_TARGET if self._auto_gain
+                                   else self._gain) - self._eff_gain)
+        e = max(self._eff_exp, 50.0)
+        bright = int(np.clip(40 + 60 * math.log10(e / 50.0), 30, 235))
         img = np.full((self.h, self.w), 28, np.uint8)
-        img = np.clip(img.astype(np.int16) + int(self._gain * 2),
+        img = np.clip(img.astype(np.int16) + int(self._eff_gain * 2),
                       0, 255).astype(np.uint8)
         for cx in (self.w // 4, 3 * self.w // 4):
             pad_w, pad_h = self.w // 5, self.h // 3
@@ -230,6 +244,59 @@ class BaslerBackend(CameraBackend):
         except Exception:
             pass
 
+    def get_status(self):
+        """Actual camera-reported values. In Continuous (auto) mode ExposureTime
+        / Gain read back the value the camera is currently using - that is the
+        readout we want while auto is running. Called on the grab thread only."""
+        s = {}
+        try:
+            s["exposure_us"] = float(self.cam.ExposureTime.Value)
+        except Exception:
+            pass
+        try:
+            s["gain_db"] = float(self.cam.Gain.Value)
+        except Exception:
+            pass
+        try:
+            s["auto_exposure"] = (self.cam.ExposureAuto.Value != "Off")
+        except Exception:
+            pass
+        try:
+            s["auto_gain"] = (self.cam.GainAuto.Value != "Off")
+        except Exception:
+            pass
+        for node in ("ResultingFrameRate", "BslResultingAcquisitionFrameRate",
+                     "AcquisitionFrameRate"):
+            try:
+                s["fps"] = float(getattr(self.cam, node).Value)
+                break
+            except Exception:
+                continue
+        try:
+            s["width"], s["height"] = int(self.cam.Width.Value), int(self.cam.Height.Value)
+        except Exception:
+            pass
+        try:
+            s["pixel_format"] = str(self.cam.PixelFormat.Value)
+        except Exception:
+            pass
+        return s
+
+    def get_ranges(self):
+        """Exposure / gain limits so the UI can size its controls to this camera."""
+        r = {}
+        try:
+            r["exposure_min"] = float(self.cam.ExposureTime.Min)
+            r["exposure_max"] = float(self.cam.ExposureTime.Max)
+        except Exception:
+            pass
+        try:
+            r["gain_min"] = float(self.cam.Gain.Min)
+            r["gain_max"] = float(self.cam.Gain.Max)
+        except Exception:
+            pass
+        return r
+
     def grab(self, timeout_ms=2000):
         res = self.cam.RetrieveResult(timeout_ms, pylon.TimeoutHandling_Return)
         if res is None:
@@ -255,12 +322,15 @@ class BaslerBackend(CameraBackend):
 # ===========================================================================
 class CameraThread(QThread):
     frameReady = pyqtSignal(object)
+    statusReady = pyqtSignal(dict)     # actual exposure/gain/fps, polled live
+    rangesReady = pyqtSignal(dict)     # exposure/gain limits, emitted once on open
     error = pyqtSignal(str)
 
     # UI -> thread setting changes are queued and applied on the grab thread,
     # so the camera object is only ever touched from one thread.
     _APPLY_ORDER = ["pixel_format", "auto_exposure", "exposure",
                     "auto_gain", "gain"]
+    _STATUS_PERIOD_S = 0.25            # how often to poll camera-reported values
 
     def __init__(self, backend):
         super().__init__()
@@ -268,6 +338,7 @@ class CameraThread(QThread):
         self._running = False
         self._mutex = QMutex()
         self._pending = {}
+        self._last_status_t = 0.0
 
     def queue(self, key, value):
         with QMutexLocker(self._mutex):
@@ -283,6 +354,19 @@ class CameraThread(QThread):
                 except Exception as e:
                     self.error.emit(f"{k}: {e}")
 
+    def _poll_status(self):
+        now = time.time()
+        if now - self._last_status_t < self._STATUS_PERIOD_S:
+            return
+        self._last_status_t = now
+        try:
+            status = self.backend.get_status()
+        except Exception as e:
+            self.error.emit(f"status: {e}")
+            return
+        if status:
+            self.statusReady.emit(status)
+
     def run(self):
         self._running = True
         try:
@@ -290,6 +374,12 @@ class CameraThread(QThread):
         except Exception as e:
             self.error.emit(f"Open failed: {e}")
             return
+        try:
+            ranges = self.backend.get_ranges()
+            if ranges:
+                self.rangesReady.emit(ranges)
+        except Exception as e:
+            self.error.emit(f"ranges: {e}")
         while self._running:
             self._apply_pending()
             try:
@@ -301,6 +391,7 @@ class CameraThread(QThread):
                 self.frameReady.emit(frame)
             else:
                 self.msleep(5)
+            self._poll_status()       # camera-reported values, on this thread
         self.backend.close()
 
     def stop(self):
@@ -410,6 +501,10 @@ class MainWindow(QMainWindow):
         self.force_mock = force_mock
         self._exp_guard = False
         self._gain_guard = False
+        self._dets = []            # last fiducial detections (for the overlay)
+        self._last_detect_t = 0.0  # throttle for live detection
+        self._last_actual_exp = None   # most recent camera-reported exposure/gain
+        self._last_actual_gain = None  # used to freeze the UI when auto turns off
         self._build_ui()
         self._populate_devices()
 
@@ -439,6 +534,7 @@ class MainWindow(QMainWindow):
         pv.addWidget(self._camera_group())
         pv.addWidget(self._exposure_group())
         pv.addWidget(self._gain_group())
+        pv.addWidget(self._readout_group())
         pv.addWidget(self._fiducial_group())
         pv.addWidget(self._capture_group())
         pv.addStretch(1)
@@ -504,6 +600,21 @@ class MainWindow(QMainWindow):
         l.addWidget(self.gain_spin)
         return box
 
+    def _readout_group(self):
+        """Live camera-reported values - populated from the grab thread, so it
+        shows the ACTUAL exposure/gain even when auto exposure/gain is on."""
+        box = QGroupBox("Live camera status")
+        l = QFormLayout(box)
+        self.ro_exp = QLabel("-")
+        self.ro_gain = QLabel("-")
+        self.ro_fps = QLabel("-")
+        self.ro_size = QLabel("-")
+        l.addRow("Exposure (actual)", self.ro_exp)
+        l.addRow("Gain (actual)", self.ro_gain)
+        l.addRow("Frame rate", self.ro_fps)
+        l.addRow("Frame / format", self.ro_size)
+        return box
+
     def _fiducial_group(self):
         box = QGroupBox("Fiducial markers")
         l = QFormLayout(box)
@@ -525,6 +636,11 @@ class MainWindow(QMainWindow):
         l.addRow("Spacing X (1<->2)", self.sx_spin)
         l.addRow("Spacing Y (1<->3)", self.sy_spin)
         l.addRow("Arrangement", self.arr_combo)
+        self.detect_chk = QCheckBox("Detect fiducials (live overlay)")
+        if not HAVE_DETECT:
+            self.detect_chk.setEnabled(False)
+            self.detect_chk.setToolTip("Needs OpenCV: pip3 install opencv-python")
+        l.addRow(self.detect_chk)
         return box
 
     def _capture_group(self):
@@ -567,6 +683,8 @@ class MainWindow(QMainWindow):
             backend = BaslerBackend(self.devices[idx], self.pf_combo.currentText())
         self.cam_thread = CameraThread(backend)
         self.cam_thread.frameReady.connect(self._on_frame)
+        self.cam_thread.statusReady.connect(self._on_status)
+        self.cam_thread.rangesReady.connect(self._on_ranges)
         self.cam_thread.error.connect(self._on_cam_error)
         self.cam_thread.start()
         QTimer.singleShot(300, self._sync_controls_to_camera)
@@ -600,11 +718,114 @@ class MainWindow(QMainWindow):
         else:
             rgb = np.ascontiguousarray(disp[:, :, ::-1])
             qimg = QImage(rgb.data, w, h, 3 * w, QImage.Format_RGB888).copy()
-        self.view.setPixmap(QPixmap.fromImage(qimg).scaled(
-            self.view.size(), Qt.KeepAspectRatio, Qt.SmoothTransformation))
+        pm = QPixmap.fromImage(qimg).scaled(
+            self.view.size(), Qt.KeepAspectRatio, Qt.SmoothTransformation)
+        if HAVE_DETECT and self.detect_chk.isChecked():
+            self._maybe_detect(frame)
+            self._draw_dets(pm, w, h)
+        self.view.setPixmap(pm)
+
+    def _maybe_detect(self, frame):
+        """Run fiducial detection on the full-res frame, throttled. Results are
+        cached so the overlay still draws on frames between detection runs."""
+        now = time.time()
+        if now - self._last_detect_t < 0.3:
+            return
+        self._last_detect_t = now
+        try:
+            self._dets = detect.detect_fiducials(detect.to_gray8(frame))
+        except Exception as e:
+            self._dets = []
+            self.status.setText(f"Detect error: {e}")
+            return
+        if self._dets:
+            conf = sum(d.confidence for d in self._dets) / len(self._dets)
+            self.status.setText(
+                f"Detected {len(self._dets)} fiducial(s), mean confidence {conf:.2f}")
+        else:
+            self.status.setText("No fiducials detected.")
+
+    def _draw_dets(self, pm, src_w, src_h):
+        if not self._dets:
+            return
+        sx, sy = pm.width() / src_w, pm.height() / src_h
+        rs = (sx + sy) / 2.0
+        p = QPainter(pm)
+        p.setRenderHint(QPainter.Antialiasing)
+        f = QFont(); f.setPointSize(9); p.setFont(f)
+        for d in self._dets:
+            color = QColor("#39d353") if d.confidence >= 0.6 else QColor("#e0a64d")
+            p.setPen(QPen(color, 2)); p.setBrush(Qt.NoBrush)
+            cx, cy, r = d.cx * sx, d.cy * sy, d.radius_px * rs
+            p.drawEllipse(QPointF(cx, cy), r, r)
+            p.drawLine(QPointF(cx - 6, cy), QPointF(cx + 6, cy))
+            p.drawLine(QPointF(cx, cy - 6), QPointF(cx, cy + 6))
+            p.drawText(QPointF(cx + r + 3, cy + 4),
+                       f"{d.label()} {d.confidence:.2f}")
+        p.end()
 
     def _on_cam_error(self, msg):
         self.status.setText(f"Camera: {msg}")
+
+    # ---- live status + range adoption ---------------------------------- #
+    def _on_status(self, d):
+        """Update the live readout from camera-reported values. When auto is on
+        the matching control is disabled, so reflect the converged value into it
+        too - the number then tracks what the camera actually settled on."""
+        exp, gain = d.get("exposure_us"), d.get("gain_db")
+        auto_e, auto_g = d.get("auto_exposure"), d.get("auto_gain")
+        if exp is not None:
+            self._last_actual_exp = exp
+            self.ro_exp.setText(f"{exp:,.0f} us" + ("   (auto)" if auto_e else ""))
+            if auto_e:
+                self._set_exp_controls(exp, queue=False)
+        if gain is not None:
+            self._last_actual_gain = gain
+            self.ro_gain.setText(f"{gain:.1f} dB" + ("   (auto)" if auto_g else ""))
+            if auto_g:
+                self._set_gain_controls(gain, queue=False)
+        fps = d.get("fps")
+        self.ro_fps.setText(f"{fps:.1f} fps" if fps is not None else "-")
+        w, h, pf = d.get("width"), d.get("height"), d.get("pixel_format")
+        if w and h:
+            self.ro_size.setText(f"{w}x{h}   {pf or ''}".strip())
+
+    def _on_ranges(self, d):
+        """Size the exposure/gain controls to this camera's actual limits."""
+        ex_min, ex_max = d.get("exposure_min"), d.get("exposure_max")
+        if ex_min is not None and ex_max is not None and ex_max > ex_min:
+            self._exp_guard = True
+            self.exp_slider.setRange(int(ex_min), int(min(ex_max, 2_000_000)))
+            self.exp_spin.setRange(ex_min, ex_max)
+            self._exp_guard = False
+        g_min, g_max = d.get("gain_min"), d.get("gain_max")
+        if g_min is not None and g_max is not None and g_max > g_min:
+            self._gain_guard = True
+            self.gain_slider.setRange(int(g_min * 10), int(g_max * 10))
+            self.gain_spin.setRange(g_min, g_max)
+            self._gain_guard = False
+
+    def _set_exp_controls(self, us, queue=True):
+        """Set both exposure widgets together (guarded), optionally queueing the
+        value to the camera. Used by the sliders and by the auto readout."""
+        self._exp_guard = True
+        self.exp_slider.setValue(int(np.clip(round(us), self.exp_slider.minimum(),
+                                              self.exp_slider.maximum())))
+        self.exp_spin.setValue(float(np.clip(us, self.exp_spin.minimum(),
+                                             self.exp_spin.maximum())))
+        self._exp_guard = False
+        if queue and self.cam_thread:
+            self.cam_thread.queue("exposure", float(us))
+
+    def _set_gain_controls(self, db, queue=True):
+        self._gain_guard = True
+        self.gain_slider.setValue(int(np.clip(round(db * 10), self.gain_slider.minimum(),
+                                               self.gain_slider.maximum())))
+        self.gain_spin.setValue(float(np.clip(db, self.gain_spin.minimum(),
+                                              self.gain_spin.maximum())))
+        self._gain_guard = False
+        if queue and self.cam_thread:
+            self.cam_thread.queue("gain", float(db))
 
     # ---- control handlers ---------------------------------------------- #
     def _on_pf(self, text):
@@ -616,6 +837,10 @@ class MainWindow(QMainWindow):
         self.exp_spin.setEnabled(not on)
         if self.cam_thread:
             self.cam_thread.queue("auto_exposure", on)
+            # Turning auto off: hold the value auto converged on, so the camera
+            # and the slider agree instead of snapping back to a stale number.
+            if not on and self._last_actual_exp is not None:
+                self._set_exp_controls(self._last_actual_exp, queue=True)
 
     def _on_exp_slider(self, v):
         if self._exp_guard:
@@ -640,6 +865,8 @@ class MainWindow(QMainWindow):
         self.gain_spin.setEnabled(not on)
         if self.cam_thread:
             self.cam_thread.queue("auto_gain", on)
+            if not on and self._last_actual_gain is not None:
+                self._set_gain_controls(self._last_actual_gain, queue=True)
 
     def _on_gain_slider(self, v):
         if self._gain_guard:
