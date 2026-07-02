@@ -87,7 +87,7 @@ from PyQt5.QtGui import QImage, QPixmap, QPainter, QPen, QColor, QFont
 from PyQt5.QtWidgets import (
     QApplication, QMainWindow, QWidget, QLabel, QSlider, QCheckBox, QComboBox,
     QPushButton, QDoubleSpinBox, QGroupBox, QVBoxLayout, QHBoxLayout,
-    QFormLayout, QFileDialog, QSizePolicy, QLineEdit
+    QFormLayout, QFileDialog, QSizePolicy, QLineEdit, QScrollArea, QFrame
 )
 
 try:
@@ -160,7 +160,7 @@ class MockBackend(CameraBackend):
             "exposure_us": self._eff_exp, "gain_db": self._eff_gain,
             "auto_exposure": self._auto_exp, "auto_gain": self._auto_gain,
             "fps": 30.0, "width": self.w, "height": self.h,
-            "pixel_format": "Mono8 (mock)",
+            "pixel_format": "Mono8",
         }
 
     def get_ranges(self):
@@ -422,7 +422,7 @@ class PalletView(QWidget):
         super().__init__()
         self.side = side_label
         self.cfg = cfg
-        self.setMinimumSize(300, 230)
+        self.setMinimumSize(200, 150)
         self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
 
     def setConfig(self, cfg):
@@ -495,9 +495,9 @@ class PalletView(QWidget):
         p.setPen(QColor("#90a4b8"))
         ff = QFont(); ff.setPointSize(8); p.setFont(ff)
         p.drawText(QRectF(0, H - footer_h + 2, W, footer_h - 2), Qt.AlignCenter,
-                   f"dia {cfg.diameter_mm:.1f} mm   "
-                   f"spacing {cfg.spacing_x_mm:.0f}x{cfg.spacing_y_mm:.0f} mm   "
-                   f"diag {cfg.diagonal_mm():.0f} mm")
+                   f"Ø{cfg.diameter_mm:.1f}  "
+                   f"{cfg.spacing_x_mm:.0f}x{cfg.spacing_y_mm:.0f} mm  "
+                   f"diag {cfg.diagonal_mm():.0f}")
         p.end()
 
 
@@ -508,7 +508,15 @@ class MainWindow(QMainWindow):
     def __init__(self, force_mock=False):
         super().__init__()
         self.setWindowTitle("FANUC Epoxy Vision - Capture & Setup")
-        self.resize(1300, 840)
+        # Size to the screen: full HD gets the roomy layout, a 1024x768 panel
+        # gets a window that actually fits (layout minimums stay under it).
+        screen = QApplication.primaryScreen()
+        if screen is not None:
+            avail = screen.availableGeometry()
+            self.resize(min(1300, avail.width() - 16),
+                        min(840, avail.height() - 40))
+        else:
+            self.resize(1300, 840)
         self.cfg = FiducialConfig()
         self.cam_thread = None
         self.last_frame = None
@@ -527,30 +535,39 @@ class MainWindow(QMainWindow):
         self._offsets = {"A": None, "B": None}      # latest PoseResult per side
         self._build_ui()
         self._populate_devices()
+        self._fit_panel_width()   # device names can change the panel's need
 
     # ---- UI construction ----------------------------------------------- #
     def _build_ui(self):
         # Left: live view + two pallet schematics
         left = QWidget()
         lv = QVBoxLayout(left)
+        lv.setContentsMargins(0, 0, 0, 0)
+        lv.setSpacing(6)
         self.view = QLabel("Camera disconnected - pick a device and press Connect")
         self.view.setAlignment(Qt.AlignCenter)
         self.view.setStyleSheet(
             "background:#0b0f14; color:#7fa8d0; border:1px solid #233; font-size:14px;")
-        self.view.setMinimumSize(640, 420)
+        self.view.setMinimumSize(420, 260)
         self.view.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
-        lv.addWidget(self.view, 1)
+        lv.addWidget(self.view, 3)
 
+        # 3:1 with the live view - the schematics keep growing on big displays
+        # instead of sitting at their minimum height.
         pallets = QHBoxLayout()
         self.pallet_a = PalletView("A", self.cfg)
         self.pallet_b = PalletView("B", self.cfg)
         pallets.addWidget(self.pallet_a)
         pallets.addWidget(self.pallet_b)
-        lv.addLayout(pallets)
+        lv.addLayout(pallets, 1)
 
-        # Right: control panel
+        # Right: control panel. The groups stack taller than a small display
+        # (1024x768 HMI panels), so they live in a scroll area - the panel then
+        # never dictates the window's minimum height.
         panel = QWidget()
         pv = QVBoxLayout(panel)
+        pv.setContentsMargins(6, 6, 6, 6)
+        pv.setSpacing(6)
         pv.addWidget(self._camera_group())
         pv.addWidget(self._exposure_group())
         pv.addWidget(self._gain_group())
@@ -559,21 +576,53 @@ class MainWindow(QMainWindow):
         pv.addWidget(self._measure_group())
         pv.addWidget(self._capture_group())
         pv.addStretch(1)
-        panel.setFixedWidth(340)
+
+        scroll = QScrollArea()
+        scroll.setWidget(panel)
+        scroll.setWidgetResizable(True)
+        scroll.setFrameShape(QFrame.NoFrame)
+        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        scroll.setVerticalScrollBarPolicy(Qt.ScrollBarAsNeeded)
+        self._panel = panel
+        self._panel_scroll = scroll
+        self._fit_panel_width()
 
         central = QWidget()
         root = QHBoxLayout(central)
+        root.setContentsMargins(6, 6, 6, 6)
+        root.setSpacing(6)
         root.addWidget(left, 1)
-        root.addWidget(panel)
+        root.addWidget(scroll)
         self.setCentralWidget(central)
 
         self.status = QLabel("Ready.")
         self.statusBar().addWidget(self.status)
 
+    @staticmethod
+    def _value_label(text="-"):
+        """A label whose (runtime-changing) text must never widen the panel -
+        it takes the space the layout gives it and clips if the text is longer."""
+        lbl = QLabel(text)
+        lbl.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Preferred)
+        return lbl
+
+    def _fit_panel_width(self):
+        """Size the control column to what the controls actually need plus the
+        vertical scrollbar, so nothing clips when the scrollbar appears. Re-run
+        after anything that can change the panel's minimum width (fonts/styles,
+        device list population)."""
+        sb_w = self._panel_scroll.verticalScrollBar().sizeHint().width()
+        self._panel_scroll.setFixedWidth(
+            self._panel.minimumSizeHint().width() + sb_w + 2)
+
     def _camera_group(self):
         box = QGroupBox("Camera")
         l = QVBoxLayout(box)
         self.dev_combo = QComboBox()
+        # Long device names (model + serial) must not widen the whole panel -
+        # show them elided; the dropdown still shows the full string.
+        self.dev_combo.setSizeAdjustPolicy(QComboBox.AdjustToMinimumContentsLengthWithIcon)
+        self.dev_combo.setMinimumContentsLength(16)
         l.addWidget(QLabel("Device"))
         l.addWidget(self.dev_combo)
         row = QHBoxLayout()
@@ -626,10 +675,10 @@ class MainWindow(QMainWindow):
         shows the ACTUAL exposure/gain even when auto exposure/gain is on."""
         box = QGroupBox("Live camera status")
         l = QFormLayout(box)
-        self.ro_exp = QLabel("-")
-        self.ro_gain = QLabel("-")
-        self.ro_fps = QLabel("-")
-        self.ro_size = QLabel("-")
+        self.ro_exp = self._value_label()
+        self.ro_gain = self._value_label()
+        self.ro_fps = self._value_label()
+        self.ro_size = self._value_label()
         l.addRow("Exposure (actual)", self.ro_exp)
         l.addRow("Gain (actual)", self.ro_gain)
         l.addRow("Frame rate", self.ro_fps)
@@ -669,8 +718,7 @@ class MainWindow(QMainWindow):
         then read dX/dY/dR + confidence per side, and publish to the PLC."""
         box = QGroupBox("Measured offset (Side A / B)")
         l = QVBoxLayout(box)
-        self.cal_label = QLabel("No calibration loaded.")
-        self.cal_label.setWordWrap(True)
+        self.cal_label = self._value_label("No calibration loaded.")
         l.addWidget(self.cal_label)
 
         row = QHBoxLayout()
@@ -682,8 +730,8 @@ class MainWindow(QMainWindow):
         row.addWidget(b_ref)
         l.addLayout(row)
 
-        self.off_a = QLabel("A: —")
-        self.off_b = QLabel("B: —")
+        self.off_a = self._value_label("A: —")
+        self.off_b = self._value_label("B: —")
         for w in (self.off_a, self.off_b):
             w.setStyleSheet("font-family: monospace;")
             l.addWidget(w)
@@ -709,7 +757,7 @@ class MainWindow(QMainWindow):
         b_save.clicked.connect(self._save)
         l.addWidget(b_save)
         row = QHBoxLayout()
-        self.outdir_label = QLabel(self.outdir); self.outdir_label.setWordWrap(True)
+        self.outdir_label = self._value_label(self.outdir)
         b_dir = QPushButton("Folder...")
         b_dir.clicked.connect(self._browse)
         row.addWidget(self.outdir_label, 1); row.addWidget(b_dir)
